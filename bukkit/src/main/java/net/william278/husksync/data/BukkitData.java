@@ -41,7 +41,6 @@ import org.bukkit.event.inventory.InventoryType;
 import org.bukkit.inventory.EquipmentSlotGroup;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.persistence.PersistentDataContainer;
-import org.bukkit.plugin.Plugin;
 import org.bukkit.potion.PotionEffect;
 import org.bukkit.potion.PotionEffectType;
 import org.jetbrains.annotations.NotNull;
@@ -50,6 +49,7 @@ import org.jetbrains.annotations.Range;
 import org.jetbrains.annotations.Unmodifiable;
 
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
 import java.util.logging.Level;
 import java.util.stream.Collectors;
 
@@ -426,7 +426,10 @@ public abstract class BukkitData implements Data {
                 final org.bukkit.Location location = new org.bukkit.Location(
                         Bukkit.getWorld(world.name()), x, y, z, yaw, pitch
                 );
-                user.getPlayer().teleport(location);
+                user.getPlayer().teleportAsync(location).exceptionally(throwable -> {
+                    plugin.log(Level.WARNING, "Failed to teleport player " + user.getUsername(), throwable);
+                    return false;
+                });
             } catch (Throwable e) {
                 throw new IllegalStateException("Failed to apply location", e);
             }
@@ -576,14 +579,25 @@ public abstract class BukkitData implements Data {
 
         @NotNull
         public static BukkitData.Attributes adapt(@NotNull Player player, @NotNull HuskSync plugin) {
-            if (!Bukkit.isPrimaryThread()) {
+            final BukkitHuskSync bukkitPlugin = (BukkitHuskSync) plugin;
+            if (bukkitPlugin.getScheduler().isUsingFolia() || !Bukkit.isPrimaryThread()) {
                 try {
-                    return Bukkit.getScheduler().callSyncMethod((Plugin) plugin, () -> adapt(player, plugin)).get();
+                    final CompletableFuture<BukkitData.Attributes> future = new CompletableFuture<>();
+                    bukkitPlugin.getScheduler().entitySpecificScheduler(player).run(
+                            () -> future.complete(adaptAttributes(player, plugin)),
+                            () -> future.completeExceptionally(new IllegalStateException(
+                                    "Failed to schedule attribute adaptation: player entity is no longer valid"))
+                    );
+                    return future.get();
                 } catch (Exception e) {
-                    throw new IllegalStateException("Failed to adapt attributes on main thread", e);
+                    throw new IllegalStateException("Failed to adapt attributes on entity thread", e);
                 }
             }
+            return adaptAttributes(player, plugin);
+        }
 
+        @NotNull
+        private static BukkitData.Attributes adaptAttributes(@NotNull Player player, @NotNull HuskSync plugin) {
             final List<Attribute> attributes = Lists.newArrayList();
             final AttributeSettings settings = plugin.getSettings().getSynchronization().getAttributes();
             Registry.ATTRIBUTE.forEach(id -> {
@@ -658,15 +672,27 @@ public abstract class BukkitData implements Data {
 
         @Override
         public void apply(@NotNull BukkitUser user, @NotNull BukkitHuskSync plugin) throws IllegalStateException {
-            if (!Bukkit.isPrimaryThread()) {
+            if (plugin.getScheduler().isUsingFolia() || !Bukkit.isPrimaryThread()) {
                 try {
-                    Bukkit.getScheduler().callSyncMethod(plugin, () -> { this.apply(user, plugin); return null; }).get();
+                    final CompletableFuture<Void> future = new CompletableFuture<>();
+                    plugin.getScheduler().entitySpecificScheduler(user.getPlayer()).run(
+                            () -> {
+                                applyAttributes(user, plugin);
+                                future.complete(null);
+                            },
+                            () -> future.completeExceptionally(new IllegalStateException(
+                                    "Failed to schedule attribute application: player entity is no longer valid"))
+                    );
+                    future.get();
                     return;
                 } catch (Exception e) {
-                    throw new IllegalStateException("Failed to apply attributes on main thread", e);
+                    throw new IllegalStateException("Failed to apply attributes on entity thread", e);
                 }
             }
+            applyAttributes(user, plugin);
+        }
 
+        private void applyAttributes(@NotNull BukkitUser user, @NotNull BukkitHuskSync plugin) {
             final AttributeSettings settings = plugin.getSettings().getSynchronization().getAttributes();
             Registry.ATTRIBUTE.forEach(id -> {
                 if (settings.isIgnoredAttribute(id.getKey().toString())) {
